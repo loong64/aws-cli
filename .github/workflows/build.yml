@@ -1,0 +1,146 @@
+name: build(aws-cli)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        default: 'latest'
+        description: 'Package version'
+        type: string
+        required: true
+  schedule:
+    - cron: '0 20 * * *'
+
+env:
+  app_name: 'aws-cli'
+  app_repo: 'aws/aws-cli'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      app_version: ${{ steps.get-version.outputs.app_version }}
+      app_build: ${{ steps.check-release.outputs.app_build }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Get Version
+        id: get-version
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.version }}" = "latest" ]; then
+            app_version=$(curl -s https://api.github.com/repos/${{ env.app_repo }}/tags | jq -r '.[0].name')
+          else
+            app_version=${{ github.event.inputs.version }}
+          fi
+          if [ -z "${app_version}" ] || [ "${app_version}" == "null" ]; then
+            echo "Failed to get version"
+            exit 1
+          fi
+          
+          echo "app_version=${app_version}" >> $GITHUB_ENV
+          echo "app_version=${app_version}" >> $GITHUB_OUTPUT
+          echo ""
+          echo "========== Build Args =========="
+          echo "app_version=${app_version}"
+
+      - name: Check Release
+        id: check-release
+        run: |
+          gh release view ${app_version} -R ${{ github.repository }} | grep awscli-exe-linux-loongarch64.zip >/dev/null 2>&1 || echo "app_build=1" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    if: needs.check.outputs.app_build == '1'
+    runs-on: ${{ matrix.runner }}
+    needs: check
+    env:
+      app_version: ${{ needs.check.outputs.app_version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: loong64
+            platform: loongarch64
+            runner: ubuntu-24.04
+          - arch: ppc64le
+            platform: ppc64le
+            runner: ubuntu-24.04
+          - arch: riscv64
+            platform: riscv64
+            runner: ubuntu-24.04
+          - arch: s390x
+            platform: s390x
+            runner: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.app_repo }}
+          ref: ${{ env.app_version }}
+
+      - uses: docker/setup-qemu-action@v3
+
+      - name: Build Binaries
+        run: |
+          DOCKER_IMAGE="ghcr.io/${{ github.repository }}:build-linux-${{ matrix.platform }}"
+          DOCKER_CMD="./scripts/installers/make-exe"
+          PIP_EXTRA_INDEX_URL="https://pypi.org/simple"
+          if [ "${{ matrix.arch }}" = "loong64" ] || [ "${{ matrix.arch }}" = "s390x" ]; then
+            PIP_EXTRA_INDEX_URL="https://gitlab.com/api/v4/projects/65746188/packages/pypi/simple"
+          fi
+
+          docker run --rm \
+            --platform linux/${{ matrix.arch }} \
+            --env PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL} \
+            --volume $(pwd):/io/${{ env.app_name }} \
+            --workdir /io/${{ env.app_name }} \
+            ${DOCKER_IMAGE} \
+            sh -c "${DOCKER_CMD}"
+
+      - name: Check Binaries
+        run: |
+          if [ "${{ matrix.arch }}" != "${{ matrix.platform }}" ]; then
+            sudo cp dist/awscli-exe.zip dist/awscli-exe-linux-${{ matrix.arch }}.zip
+          fi
+          sudo mv dist/awscli-exe.zip dist/awscli-exe-linux-${{ matrix.platform }}.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.app_name }}-linux-${{ matrix.platform }}
+          path: dist/*.zip
+
+  release:
+    if: needs.check.outputs.app_build == '1'
+    runs-on: ubuntu-24.04
+    needs:
+      - check
+      - build
+    env:
+      app_version: ${{ needs.check.outputs.app_version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download release
+        uses: actions/download-artifact@v5
+        with:
+          pattern: ${{ env.app_name }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          TAG_NAME="${{ env.app_version }}"
+          gh release create "${TAG_NAME}" \
+            --generate-notes \
+            --title "${TAG_NAME}" \
+            dist/*
