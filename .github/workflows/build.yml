@@ -11,6 +11,10 @@ on:
   schedule:
     - cron: '0 20 * * *'
 
+permissions:
+  contents: write
+  packages: write
+
 env:
   app_name: 'aws-cli'
   app_repo: 'aws/aws-cli'
@@ -137,7 +141,7 @@ jobs:
 
       - name: Create release
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG_NAME="${{ env.app_version }}"
           gh release create "${TAG_NAME}" \
